@@ -1,0 +1,202 @@
+<源码来源：http://blog.csdn.net/zzsfqiuyigui/article/details/7867251 >
+CFS允许每个进程运行一段时间、循环轮转、选择运行最少的进程作为下一个运行进程。
+分配给进程的运行时间 = 调度周期 * 进程权重 / 所有进程权重之和 
+vruntime = 实际运行时间 * 1024 / 进程权重  （1024，实际上它等于nice为0的进程的权重，代码中是NICE_0_LOAD。 nice值在CFS中被作为进程获得的处理器运行比的权重：越高的 nice值（越低的优先级）进程获得更低的处理器使用权重，这是相对默认nice值进程的进程而言的；相反，更低的nice值（越高的优先级）的进程获得 更高的处理器使用权重。）
+
+/*运行队列中删除函数dequeue_task_fair*/
+static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int sleep)
+{
+	struct cfs_rq *cfs_rq;
+	struct sched_entity *se = &p->se;
+
+	for_each_sched_entity(se) {
+		cfs_rq = cfs_rq_of(se);/*获得se对应的运行队列*/
+		dequeue_entity(cfs_rq, se, sleep);
+		/* Don't dequeue parent if it has other entities besides us */
+		if (cfs_rq->load.weight)
+			break;
+		sleep = 1;
+	}
+	/*更新hrtick*/
+	hrtick_update(rq);
+}
+
+/*删除动作发生在进程阻塞(变为不可运行状态)或者终止时(结束运行)*/
+static void dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int sleep)
+{
+	update_curr(cfs_rq);
+	update_stats_dequeue(cfs_rq, se);
+	if (sleep) {
+#ifdef CONFIG_SCHEDSTATS
+		if (entity_is_task(se)) {
+			struct task_struct *tsk = task_of(se);
+			if (tsk->state & TASK_INTERRUPTIBLE)
+				se->sleep_start = rq_of(cfs_rq)->clock;
+			if (tsk->state & TASK_UNINTERRUPTIBLE)
+				se->block_start = rq_of(cfs_rq)->clock;
+		}
+#endif
+	}
+	clear_buddies(cfs_rq, se);
+	if (se != cfs_rq->curr)
+		__dequeue_entity(cfs_rq, se);
+	account_entity_dequeue(cfs_rq, se);
+	update_min_vruntime(cfs_rq);
+}
+/*实现记账功能,由系统定时器周期调用*/
+static void update_curr(struct cfs_rq *cfs_rq)
+{
+	struct sched_entity *curr = cfs_rq->curr;
+	u64 now = rq_of(cfs_rq)->clock;/*now计时器*/
+	unsigned long delta_exec;
+
+	if (unlikely(!curr))
+		return;
+	 /*获得从最后一次修改负载后当前任务所占用的运行总时间,即计算当前进程的执行时间*/
+	delta_exec = (unsigned long)(now - curr->exec_start);
+	if (!delta_exec)/*如果本次没有执行过，不用重新更新了*/
+		return;
+	/*根据当前可运行进程总数对运行时间进行加权计算*/
+	__update_curr(cfs_rq, curr, delta_exec);
+	curr->exec_start = now;/*将exec_start属性置为now*/
+
+	if (entity_is_task(curr)) {/*下面为关于组调度的，暂时不分析了*/
+		struct task_struct *curtask = task_of(curr);
+
+		trace_sched_stat_runtime(curtask, delta_exec, curr->vruntime);
+		cpuacct_charge(curtask, delta_exec);
+		account_group_exec_runtime(curtask, delta_exec);
+	}
+}
+static inline void
+__update_curr(struct cfs_rq *cfs_rq, struct sched_entity *curr,
+	      unsigned long delta_exec)
+{
+	unsigned long delta_exec_weighted;
+
+	schedstat_set(curr->exec_max, max((u64)delta_exec, curr->exec_max));
+	/*总运行时间更新*/
+	curr->sum_exec_runtime += delta_exec;
+	/*更新cfs_rq的exec_clock*/
+	schedstat_add(cfs_rq, exec_clock, delta_exec);
+	/*用优先级和delta_exec来计算weighted以用于更细vruntime*/
+	delta_exec_weighted = calc_delta_fair(delta_exec, curr);
+	/*vruntime可以准确地测量给定进程的运行时间，知道谁应该是下一个被运行的进程*/
+
+	/*更新进程的vruntime*/
+	curr->vruntime += delta_exec_weighted;
+	update_min_vruntime(cfs_rq);
+}
+static inline unsigned long calc_delta_fair(unsigned long delta, struct sched_entity *se){
+ 	/*NICE_0_LOAD: 优先级0 的weight*/ 
+   	 /* 如果不是优先级0,就要调用calc_delta_mine计算delta的weight值*/ 
+	if (unlikely(se->load.weight != NICE_0_LOAD))
+		delta = calc_delta_mine(delta, NICE_0_LOAD, &se->load);
+
+	return delta;
+}
+ /*calc_delta_mine (delta_exec,weight,lw),它的执行过程约为delta *= weight / lw.如果进程的优先级为0,那么就是返回delta；如果不为0,就会调用calc_delta_mine()对delta值进行修正. se->load就是表示nice对应的load值,nice越低,值越大.在执行相同时间的条件下(delta相同),高优先的进程计算出来的delta值会比低优先级的进程计算出来的低.应此,高优先的进程就会位于rb_tree的左边,在下次调度的时候就会优先调度. */
+static unsigned long calc_delta_mine(unsigned long delta_exec, unsigned long weight,struct load_weight *lw)
+{
+	u64 tmp;
+	if (!lw->inv_weight) {
+		if (BITS_PER_LONG > 32 && unlikely(lw->weight >= WMULT_CONST))
+			lw->inv_weight = 1;
+		else
+			lw->inv_weight = 1 + (WMULT_CONST-lw->weight/2)
+				/ (lw->weight+1);
+	}
+	tmp = (u64)delta_exec * weight;
+	if (unlikely(tmp > WMULT_CONST))
+		tmp = SRR(SRR(tmp, WMULT_SHIFT/2) * lw->inv_weight,
+			WMULT_SHIFT/2);
+	else
+		tmp = SRR(tmp * lw->inv_weight, WMULT_SHIFT);
+	return (unsigned long)min(tmp, (u64)(unsigned long)LONG_MAX);
+}
+
+/*删除函数最终将由下面函数从红黑树里面删除*/
+static void __dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
+{
+	if (cfs_rq->rb_leftmost == &se->run_node) {
+		struct rb_node *next_node;
+
+		next_node = rb_next(&se->run_node);
+		cfs_rq->rb_leftmost = next_node;
+	}
+
+	rb_erase(&se->run_node, &cfs_rq->tasks_timeline);
+}
+
+/*向运行队列中添加项的函数为enqueue_task_fair完成*/
+static void enqueue_task_fair(struct rq *rq, struct task_struct *p, int wakeup)
+{
+	struct cfs_rq *cfs_rq;
+	struct sched_entity *se = &p->se;
+	/*对于主调度，会对一个组中的所有进程进行操作*/
+	for_each_sched_entity(se) {
+		if (se->on_rq)
+			break;
+		cfs_rq = cfs_rq_of(se);
+		enqueue_entity(cfs_rq, se, wakeup);
+		wakeup = 1;
+	}
+	hrtick_update(rq);
+}
+
+/*该函数更新相关调度信息后最终会调用下面函数插入运行进程的红黑树*/
+static void __enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se)
+{
+	struct rb_node **link = &cfs_rq->tasks_timeline.rb_node;
+	struct rb_node *parent = NULL;
+	struct sched_entity *entry;
+	s64 key = entity_key(cfs_rq, se);
+	int leftmost = 1;
+
+	/*查找在树中的位置*/
+	while (*link) {
+		parent = *link;
+		entry = rb_entry(parent, struct sched_entity, run_node);
+		  
+/*key为被插入进程的vruntime*/
+		if (key < entity_key(cfs_rq, entry)) {
+			link = &parent->rb_left;
+		} else {
+			link = &parent->rb_right;
+			leftmost = 0;
+		}
+	}
+
+	if (leftmost)
+		cfs_rq->rb_leftmost = &se->run_node;
+
+	rb_link_node(&se->run_node, parent, link);
+	rb_insert_color(&se->run_node, &cfs_rq->tasks_timeline);
+}
+/*实现选择的函数为 pick_next_task_fair。CFS的运行队列布局是放在红黑树里面的，而这颗红黑树的排序方式是按照运行实体的vruntime来的，其中节点的键值便是可运行进程的虚拟运行时间。CFS调 度器选取待运行的下一个进程，是所有进程中vruntime最小的那个，他对应的便是在树中最左侧的叶子节点。*/
+static struct task_struct *pick_next_task_fair(struct rq *rq)
+{
+	struct task_struct *p;
+	struct cfs_rq *cfs_rq = &rq->cfs;
+	struct sched_entity *se;
+	if (unlikely(!cfs_rq->nr_running))
+		return NULL;
+
+	do {/*此循环为了考虑组调度*/
+		se = pick_next_entity(cfs_rq);
+		set_next_entity(cfs_rq, se);/*设置为当前运行进程*/
+		cfs_rq = group_cfs_rq(se);
+	} while (cfs_rq);
+	p = task_of(se);
+	hrtick_start_fair(rq, p);
+	return p;
+}
+/*函数本身并不会遍历数找到最左叶子节点(是所有进程中vruntime最小的那个),因为该值已经缓存在rb_leftmost字段中*/
+static struct sched_entity *__pick_next_entity(struct cfs_rq *cfs_rq)
+{
+	/*rb_leftmost为保存的红黑树的最左边的节点*/
+	struct rb_node *left = cfs_rq->rb_leftmost;
+	if (!left)
+		return NULL;
+	return rb_entry(left, struct sched_entity, run_node);
+}
